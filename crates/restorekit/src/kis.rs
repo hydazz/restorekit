@@ -15,16 +15,27 @@
 //! for the restore itself (`restorekit-sys/patches/libirecovery`).
 
 use std::collections::HashMap;
+#[cfg(not(target_os = "macos"))]
+use std::io;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(not(target_os = "macos"))]
-use nusb::transfer::{Buffer, Bulk, In, Out};
+use nusb::transfer::{Buffer, Bulk, Completion, In, Out, TransferError};
 use nusb::MaybeFuture;
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-const PORTAL_CONFIG: u8 = 0x01;
-const PORTAL_RSM: u8 = 0x10;
+/// The config portal, on bulk endpoints 0x01 and 0x81.
+pub const PORTAL_CONFIG: u8 = 0x01;
+/// The RSM portal, on bulk endpoints 0x03 and 0x83.
+pub const PORTAL_RSM: u8 = 0x10;
+/// Read registers: the request command a request word starts with.
+pub const READ_REGISTERS: u32 = 0;
+/// Write registers.
+pub const WRITE_REGISTERS: u32 = 1;
+/// Read memory.
+pub const READ_MEMORY: u32 = 2;
+/// Write memory.
+pub const WRITE_MEMORY: u32 = 3;
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const INDEX_ENABLE_A: u16 = 0x0a;
@@ -37,6 +48,12 @@ const ENABLE_A: u32 = 0x21;
 const ENABLE_B: u32 = 0x01;
 
 const HEADER_LEN: usize = 12;
+/// A reply's trailer: the bytes the device moved and its status.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const TRAILER_LEN: usize = 8;
+/// The most one memory request carries.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+const MAX_MEMORY: usize = 0x10000;
 /// Size of the device-info block the GET_INFO reply carries after its header.
 const INFO_LEN: usize = 0x300;
 /// Offset of the embedded USB device descriptor inside the info block.
@@ -51,7 +68,7 @@ const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a Debug USB device answered to GET_INFO.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Read {
+pub enum Read {
     /// In DFU: the identity string (`CPID:… ECID:…`).
     Serial(String),
     /// It answered, but with no info block: the chip isn't in DFU (e.g. a
@@ -180,50 +197,48 @@ fn read(info: &nusb::DeviceInfo) -> Read {
         None => {}
     }
     match get_info(info) {
-        Ok(reply) => classify(&reply),
+        Ok(block) => parse_info(&block),
         Err(_) => Read::Failed,
     }
 }
 
-/// A full reply carries the 0x300-byte info block; a short one (just the
-/// header and the size/status trailer) means the device has none to give.
-fn classify(reply: &[u8]) -> Read {
-    if reply.len() < HEADER_LEN + INFO_LEN {
+/// What a GET_INFO block says: the 0x300-byte info block of a chip in DFU,
+/// whose `aDFU` identity carries the serial; anything shorter, such as the
+/// nothing a booted device with Debug USB on answers, means it has none.
+pub fn parse_info(block: &[u8]) -> Read {
+    if block.len() < INFO_LEN {
         return Read::NotInDfu;
     }
-    match serial_from_info(&reply[HEADER_LEN..]) {
+    match serial_from_info(block) {
         Some(serial) => Read::Serial(serial),
         None => Read::Failed,
     }
 }
 
-/// The raw GET_INFO reply (header, info block, trailer) for the device.
+/// The GET_INFO block for the device.
 #[cfg(not(target_os = "macos"))]
 fn get_info(info: &nusb::DeviceInfo) -> Result<Vec<u8>, String> {
-    let dev = info.open().wait().map_err(|e| format!("open: {e}"))?;
-    let iface = dev
-        .claim_interface(0)
-        .wait()
-        .map_err(|e| format!("claim interface 0: {e}"))?;
-    let mut config = Portal::open(&iface, 0x01).ok_or("open EP 0x01/0x81")?;
-    let mut rsm = Portal::open(&iface, 0x03).ok_or("open EP 0x03/0x83")?;
-    config
-        .request(PORTAL_CONFIG, INDEX_ENABLE_A, &[ENABLE_A], 1)
-        .ok_or("config write 0x0a")?;
-    config
-        .request(PORTAL_CONFIG, INDEX_ENABLE_B, &[ENABLE_B], 1)
-        .ok_or("config write 0x14")?;
-    rsm.request(PORTAL_RSM, INDEX_GET_INFO, &[], INFO_LEN / 4)
-        .ok_or_else(|| "GET_INFO".to_string())
+    let mut kis = Kis::open(info).map_err(|e| e.to_string())?;
+    kis.get_info().map_err(|e| format!("GET_INFO: {e}"))
 }
 
-/// The raw GET_INFO reply, through `deviceinterfaced`. It enables the device
+/// The GET_INFO block, through `deviceinterfaced`. It enables the device
 /// itself when it attaches, so there's no config write here.
 #[cfg(target_os = "macos")]
 fn get_info(info: &nusb::DeviceInfo) -> Result<Vec<u8>, String> {
     let id = dic::interface_for(info.registry_entry_id())?;
-    let req = header(PORTAL_RSM, INDEX_GET_INFO, 0, INFO_LEN / 4);
-    dic::request(id, &req, HEADER_LEN + INFO_LEN + 8)
+    let req = header(
+        0,
+        PORTAL_RSM,
+        request_word(READ_REGISTERS, INDEX_GET_INFO, INFO_LEN / 4),
+        0,
+    );
+    let reply = dic::request(id, &req, HEADER_LEN + INFO_LEN + TRAILER_LEN)?;
+    // The header, the block, then the trailer.
+    Ok(reply
+        .get(HEADER_LEN..reply.len().saturating_sub(TRAILER_LEN))
+        .unwrap_or_default()
+        .to_vec())
 }
 
 /// Which Mac in DFU over Debug USB each restore on this host is working on.
@@ -389,13 +404,12 @@ pub fn probe() -> String {
         #[cfg(target_os = "macos")]
         let _ = writeln!(out, "  registry entry id {:#x}", info.registry_entry_id());
         match get_info(info) {
-            Ok(reply) => {
-                let _ = writeln!(out, "  GET_INFO reply, {} bytes:", reply.len());
-                hexdump(&mut out, &reply);
-                let body = reply.get(HEADER_LEN..).unwrap_or_default();
-                let _ = writeln!(out, "  reads as: {:?}", classify(&reply));
-                let _ = writeln!(out, "  serial: {:?}", serial_from_info(body));
-                let _ = writeln!(out, "  nonces: {:?}", nonces_from_info(body));
+            Ok(block) => {
+                let _ = writeln!(out, "  GET_INFO block, {} bytes:", block.len());
+                hexdump(&mut out, &block);
+                let _ = writeln!(out, "  reads as: {:?}", parse_info(&block));
+                let _ = writeln!(out, "  serial: {:?}", serial_from_info(&block));
+                let _ = writeln!(out, "  nonces: {:?}", nonces_from_info(&block));
             }
             Err(e) => {
                 let _ = writeln!(out, "  GET_INFO failed: {e}");
@@ -585,60 +599,223 @@ mod apple_kis {
     }
 }
 
-/// A KIS portal: a bulk OUT/IN endpoint pair.
+/// One claimed KIS interface, with its config and RSM portals. Replies are
+/// matched to requests by sequence number, so every request to a device goes
+/// through the one holder of this. A request ends only at a short packet, so
+/// one that fills its last packet is followed by an empty one.
 #[cfg(not(target_os = "macos"))]
-struct Portal {
-    out: nusb::Endpoint<Bulk, Out>,
-    inp: nusb::Endpoint<Bulk, In>,
+pub struct Kis {
+    _interface: nusb::Interface,
+    config: (nusb::Endpoint<Bulk, Out>, nusb::Endpoint<Bulk, In>),
+    rsm: (nusb::Endpoint<Bulk, Out>, nusb::Endpoint<Bulk, In>),
+    seq: u16,
+}
+
+/// A reply's data, then how many bytes the device moved and its status.
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct Reply {
+    pub data: Vec<u8>,
+    pub size: u32,
+    pub status: u32,
 }
 
 #[cfg(not(target_os = "macos"))]
-impl Portal {
-    fn open(iface: &nusb::Interface, ep: u8) -> Option<Portal> {
-        Some(Portal {
-            out: iface.endpoint::<Bulk, Out>(ep).ok()?,
-            inp: iface.endpoint::<Bulk, In>(ep | 0x80).ok()?,
-        })
+fn done(completion: Completion) -> io::Result<Completion> {
+    match completion.status {
+        Ok(()) => Ok(completion),
+        Err(TransferError::Cancelled) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Debug USB stopped answering",
+        )),
+        Err(TransferError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "Debug USB left",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl Kis {
+    /// Claim the device's KIS interface and enable it, as libirecovery does.
+    pub fn open(info: &nusb::DeviceInfo) -> io::Result<Self> {
+        let device = info.open().wait()?;
+        if device
+            .active_configuration()
+            .map_or(true, |config| config.configuration_value() != 1)
+        {
+            device.set_configuration(1).wait()?;
+        }
+        let interface = device.claim_interface(0).wait()?;
+        let pair = |number| -> io::Result<_> {
+            Ok((
+                interface.endpoint::<Bulk, Out>(number)?,
+                interface.endpoint::<Bulk, In>(number | 0x80)?,
+            ))
+        };
+        let mut kis = Self {
+            config: pair(0x01)?,
+            rsm: pair(0x03)?,
+            _interface: interface,
+            seq: 0,
+        };
+        kis.write_config(INDEX_ENABLE_A, ENABLE_A)?;
+        kis.write_config(INDEX_ENABLE_B, ENABLE_B)?;
+        Ok(kis)
     }
 
-    fn request(
+    /// Send a request to a portal and wait for its reply of up to `reply`
+    /// bytes of data. A reply to an earlier request that timed out is passed
+    /// over.
+    pub fn request(
         &mut self,
         portal: u8,
-        index: u16,
-        args: &[u32],
-        reply_words: usize,
-    ) -> Option<Vec<u8>> {
-        let mut req = header(portal, index, args.len(), reply_words).to_vec();
-        for a in args {
-            req.extend_from_slice(&a.to_le_bytes());
+        request: u32,
+        args: &[u8],
+        reply: usize,
+    ) -> io::Result<Reply> {
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        let mut message = header(seq, portal, request, args.len()).to_vec();
+        message.extend_from_slice(args);
+        let (out, inp) = if portal == PORTAL_CONFIG {
+            &mut self.config
+        } else {
+            &mut self.rsm
+        };
+        let length = message.len();
+        let sent = done(out.transfer_blocking(message.into(), TIMEOUT))?;
+        if sent.actual_len != length {
+            return Err(io::Error::other("Debug USB took part of a request"));
         }
-        self.out
-            .transfer_blocking(req.into(), TIMEOUT)
-            .status
-            .ok()?;
-        // Reply: header, payload words, then a size/status trailer. IN transfers
-        // must be a whole number of max-size packets.
-        let mps = self.inp.max_packet_size().max(1);
-        let want = (HEADER_LEN + reply_words * 4 + 8).div_ceil(mps) * mps;
-        let done = self.inp.transfer_blocking(Buffer::new(want), TIMEOUT);
-        done.status.ok()?;
-        Some(done.buffer.into_vec())
+        if length.is_multiple_of(out.max_packet_size()) {
+            done(out.transfer_blocking(Buffer::new(0), TIMEOUT))?;
+        }
+        let packet = inp.max_packet_size().max(1);
+        let want = (HEADER_LEN + reply + TRAILER_LEN).div_ceil(packet) * packet;
+        loop {
+            let reply = done(inp.transfer_blocking(Buffer::new(want), TIMEOUT))?.buffer;
+            let n = reply.len();
+            if n >= HEADER_LEN + TRAILER_LEN
+                && reply[3] == portal
+                && reply[..2] == seq.to_le_bytes()
+            {
+                let word = |at: usize| u32::from_le_bytes(reply[at..at + 4].try_into().unwrap());
+                return Ok(Reply {
+                    size: word(n - 8),
+                    status: word(n - 4),
+                    data: reply[HEADER_LEN..n - TRAILER_LEN].to_vec(),
+                });
+            }
+        }
+    }
+
+    pub fn write_config(&mut self, index: u16, value: u32) -> io::Result<()> {
+        self.request(
+            PORTAL_CONFIG,
+            request_word(WRITE_REGISTERS, index, 1),
+            &value.to_le_bytes(),
+            0,
+        )?;
+        Ok(())
+    }
+
+    /// Write one RSM register; the reply says how many bytes it took.
+    pub fn write_register(&mut self, index: u16, value: u32) -> io::Result<u32> {
+        let reply = self.request(
+            PORTAL_RSM,
+            request_word(WRITE_REGISTERS, index, 1),
+            &value.to_le_bytes(),
+            0,
+        )?;
+        Ok(reply.size)
+    }
+
+    /// Read RSM registers. A device whose RSM side is not up returns fewer.
+    pub fn read_registers(&mut self, index: u16, count: usize) -> io::Result<Vec<u32>> {
+        let reply = self.request(
+            PORTAL_RSM,
+            request_word(READ_REGISTERS, index, count),
+            &[],
+            4 * count,
+        )?;
+        Ok(reply.data.as_chunks::<4>().0[..]
+            .iter()
+            .take(count)
+            .map(|word| u32::from_le_bytes(*word))
+            .collect())
+    }
+
+    /// The GET_INFO block: registers 0x100 on, empty when there is none.
+    pub fn get_info(&mut self) -> io::Result<Vec<u8>> {
+        Ok(self
+            .read_registers(INDEX_GET_INFO, INFO_LEN / 4)?
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect())
+    }
+
+    /// Read `len` bytes of memory in address space `space`.
+    pub fn read_memory(&mut self, space: u32, address: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut data = self.memory(space, false, address, &[], len)?;
+        data.truncate(len);
+        Ok(data)
+    }
+
+    /// Write memory in address space `space`, in requests the device takes.
+    pub fn write_memory(&mut self, space: u32, address: u64, data: &[u8]) -> io::Result<()> {
+        for (offset, chunk) in (0..).step_by(MAX_MEMORY).zip(data.chunks(MAX_MEMORY)) {
+            self.memory(space, true, address + offset, chunk, chunk.len())?;
+        }
+        Ok(())
+    }
+
+    fn memory(
+        &mut self,
+        space: u32,
+        write: bool,
+        address: u64,
+        data: &[u8],
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let mut args = Vec::with_capacity(12 + data.len());
+        args.extend_from_slice(&address.to_le_bytes());
+        args.extend_from_slice(&u32::try_from(len).map_err(io::Error::other)?.to_le_bytes());
+        args.extend_from_slice(data);
+        let command = if write { WRITE_MEMORY } else { READ_MEMORY };
+        let reply = self.request(
+            PORTAL_RSM,
+            command | space << 8,
+            &args,
+            if write { 0 } else { len },
+        )?;
+        if reply.size as usize != len || (!write && reply.data.len() < len) {
+            return Err(io::Error::other(format!(
+                "Debug USB moved {} of {len} bytes at {address:#x} (status {:#x})",
+                reply.size, reply.status
+            )));
+        }
+        Ok(reply.data)
     }
 }
 
-/// The 12-byte KIS request header (libirecovery's `irecv_kis_request_init`).
-fn header(portal: u8, index: u16, arg_count: usize, reply_words: usize) -> [u8; HEADER_LEN] {
-    let req_size = (arg_count * 4) as u32;
+/// The 12-byte KIS request header (libirecovery's `irecv_kis_request_init`):
+/// sequence, protocol version 0xa0, portal, the request word and the length
+/// of the arguments that follow.
+fn header(seq: u16, portal: u8, request: u32, args_len: usize) -> [u8; HEADER_LEN] {
     let mut h = [0u8; HEADER_LEN];
-    // h[0..2]: sequence number, ignored by the device.
-    h[2] = 0xa0; // protocol version
+    h[0..2].copy_from_slice(&seq.to_le_bytes());
+    h[2] = 0xa0;
     h[3] = portal;
-    h[4] = arg_count as u8;
-    h[5] = (index & 0xff) as u8;
-    h[6] = (((index >> 8) & 0x3) as u8) | (((reply_words << 2) & 0xfc) as u8);
-    h[7] = ((reply_words >> 6) & 0xff) as u8;
-    h[8..12].copy_from_slice(&req_size.to_le_bytes());
+    h[4..8].copy_from_slice(&request.to_le_bytes());
+    h[8..12].copy_from_slice(&(args_len as u32).to_le_bytes());
     h
+}
+
+/// A register request word: the command, the first register and how many.
+pub fn request_word(command: u32, index: u16, count: usize) -> u32 {
+    command | u32::from(index) << 8 | (count as u32) << 18
 }
 
 /// Pull the serial string out of a GET_INFO info block: the embedded device
@@ -952,13 +1129,23 @@ mod tests {
     fn header_matches_libirecovery() {
         // GET_INFO on the RSM portal, 0xC0 reply words, no args.
         assert_eq!(
-            header(PORTAL_RSM, INDEX_GET_INFO, 0, INFO_LEN / 4),
+            header(
+                0,
+                PORTAL_RSM,
+                request_word(READ_REGISTERS, INDEX_GET_INFO, INFO_LEN / 4),
+                0
+            ),
             [0, 0, 0xa0, 0x10, 0, 0x00, 0x01, 0x03, 0, 0, 0, 0]
         );
-        // Config write: one arg, one reply word.
+        // Config write: one register, its value as the argument.
         assert_eq!(
-            header(PORTAL_CONFIG, INDEX_ENABLE_A, 1, 1),
-            [0, 0, 0xa0, 0x01, 1, 0x0a, 0x04, 0x00, 4, 0, 0, 0]
+            header(
+                7,
+                PORTAL_CONFIG,
+                request_word(WRITE_REGISTERS, INDEX_ENABLE_A, 1),
+                4
+            ),
+            [7, 0, 0xa0, 0x01, 1, 0x0a, 0x04, 0x00, 4, 0, 0, 0]
         );
     }
 
@@ -980,12 +1167,9 @@ mod tests {
 
     #[test]
     fn short_reply_means_not_in_dfu() {
-        // What a booted iPhone with Debug USB on answered: header + trailer.
-        let reply = [
-            0x00, 0x80, 0xa0, 0x10, 0, 0x01, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        assert_eq!(classify(&reply), Read::NotInDfu);
-        assert_eq!(classify(&[0u8; HEADER_LEN + INFO_LEN + 8]), Read::Failed);
+        // What a booted iPhone with Debug USB on answered: no block at all.
+        assert_eq!(parse_info(&[]), Read::NotInDfu);
+        assert_eq!(parse_info(&[0u8; INFO_LEN]), Read::Failed);
     }
 
     #[test]
