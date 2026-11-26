@@ -1489,6 +1489,71 @@ pub fn read_ecid(info: &nusb::DeviceInfo) -> Option<u64> {
     ecid_from_bos(&read_bos(&info.open().wait().ok()?)?)
 }
 
+/// The ECID a running Apple device reported to macOS's `remoted` in the
+/// RemoteXPC service-discovery handshake on its private USB network link
+/// (`UniqueChipID`). `remoted` holds the device's one discovery session, so
+/// it is asked, through `remotectl`, for the device whose `LocationID` is
+/// this USB device's. This names a running Neo, whose tunnelled device
+/// stalls the BOS request [`read_ecid`] makes.
+#[cfg(target_os = "macos")]
+pub fn remote_ecid(info: &nusb::DeviceInfo) -> Option<u64> {
+    if info.vendor_id() != APPLE_VID {
+        return None;
+    }
+    let location = u64::from(info.location_id());
+    let list = remotectl(&["list"])?;
+    let device = remote_devices(&list)
+        .find(|device| remote_property(device, "LocationID") == Some(location))?;
+    remote_property(device, "UniqueChipID").filter(|&ecid| ecid != 0)
+}
+
+/// The UUIDs `remotectl list` begins its lines with, one a device.
+#[cfg(any(target_os = "macos", test))]
+fn remote_devices(list: &str) -> impl Iterator<Item = &str> {
+    list.lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|id| id.len() == 36 && id.split('-').map(str::len).eq([8, 4, 4, 4, 12]))
+}
+
+/// A numeric property of the remote device with this UUID.
+#[cfg(target_os = "macos")]
+fn remote_property(device: &str, name: &str) -> Option<u64> {
+    remotectl(&["get-property", device, name])?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// What `remotectl` prints, when it succeeds within a second.
+#[cfg(target_os = "macos")]
+fn remotectl(arguments: &[&str]) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/usr/libexec/remotectl")
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    status.success().then_some(output)
+}
+
 /// Fill in each billboard device's advertised alternate-mode SVID by opening it
 /// and reading its Billboard capability descriptor. Best-effort: a device we
 /// can't open (or one whose descriptor omits the capability) keeps
@@ -1589,6 +1654,17 @@ pub fn wait_where(timeout: Duration, mut pred: impl FnMut(&Device) -> bool) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_devices_are_the_uuids_remotectl_lists() {
+        let list = "BF98B009-DFFC-4022-8420-330518B5F5A6 ncm-14           Mac17,3      J813AP   27.2.1 (26B131/-) -\n\
+                    not-a-uuid ncm-15 Mac17,3\n\
+                    \n";
+        assert_eq!(
+            super::remote_devices(list).collect::<Vec<_>>(),
+            ["BF98B009-DFFC-4022-8420-330518B5F5A6"]
+        );
+    }
+
     use super::*;
 
     #[test]
