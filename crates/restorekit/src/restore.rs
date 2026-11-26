@@ -352,38 +352,49 @@ const RESTORE_ATTEMPTS: u32 = 5;
 /// mode" before the device reappeared.
 const RESTORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Whether a failed restore is worth retrying: the log tail indicates the
-/// device connection dropped mid-transfer rather than a real restore error
-/// (bad firmware, TSS rejection, ...).
-fn is_transient_failure(err: &Error) -> bool {
-    const MARKERS: &[&str] = &[
-        // libimobiledevice property-list-service short write (e.g. -256).
-        "Failed to send data",
-        // restored read side dropped.
-        "Could not read data",
-        "Unable to receive message from FDR",
-        "usb_bulk_transfer",
-        // The target dropped off USB during the DFU→recovery reboot while the
-        // stage-1 (iBEC/RestoreDCP) components were going over — almost always
-        // recovers on another attempt once the device settles.
-        "Unable to place device into recovery mode from DFU mode",
-        "Unable to send iBoot stage 1 components",
-    ];
-    // The ASR filesystem push dropping mid-transfer (flaky USB) is transient, but
-    // its signature gets buried: the device emits dozens of trailing errors (the
-    // per-chunk send retries, then "Unable to discover device mode") that push
-    // the real marker out of the short display tail. So scan a much larger slice
-    // of the just-failed attempt's captured log for the ASR-drop signature.
-    // These are specific to the transport push and never appear in a genuine
-    // restore-operation failure, so they won't cause those to retry.
-    const TRANSPORT_MARKERS: &[&str] = &["Unable to send data to ASR", "Unable to send filesystem"];
-    let Error::RestoreFailed { log_tail, .. } = err else {
-        return false;
-    };
-    MARKERS.iter().any(|m| log_tail.contains(m))
-        || TRANSPORT_MARKERS
+const ASR_DROPS: &[&str] = &["Unable to send data to ASR", "Unable to send filesystem"];
+
+impl Error {
+    /// The failed attempt reported a USB transport error that another attempt can recover from.
+    pub fn is_transient_restore_failure(&self) -> bool {
+        const MARKERS: &[&str] = &[
+            // libimobiledevice property-list-service short write (e.g. -256).
+            "Failed to send data",
+            // restored read side dropped.
+            "Could not read data",
+            "Unable to receive message from FDR",
+            "usb_bulk_transfer",
+            // The target dropped off USB during the DFU→recovery reboot while the
+            // stage-1 (iBEC/RestoreDCP) components were going over — almost always
+            // recovers on another attempt once the device settles.
+            "Unable to place device into recovery mode from DFU mode",
+            "Unable to send iBoot stage 1 components",
+        ];
+        let Self::RestoreFailed { log_tail, .. } = self else {
+            return false;
+        };
+        MARKERS
             .iter()
-            .any(|m| sys::error_tail(500).contains(m))
+            .chain(ASR_DROPS)
+            .any(|marker| log_tail.contains(marker))
+    }
+}
+
+/// ASR retries can bury the original transfer error below the final diagnostics.
+fn failure_tail() -> String {
+    let tail = sys::error_tail(20);
+    if ASR_DROPS.iter().any(|marker| tail.contains(marker)) {
+        return tail;
+    }
+    let history = sys::error_tail(500);
+    match history
+        .lines()
+        .rev()
+        .find(|line| ASR_DROPS.iter().any(|marker| line.contains(marker)))
+    {
+        Some(cause) => format!("{cause}\n{tail}"),
+        None => tail,
+    }
 }
 
 /// Appended to a restore that failed loading iBoot's stage-1 firmware even
@@ -522,7 +533,7 @@ fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Complet
                 progress(Event::Done);
                 return Ok(completion);
             }
-            Err(e) if attempt < attempts && is_transient_failure(&e) => {
+            Err(e) if attempt < attempts && e.is_transient_restore_failure() => {
                 progress(Event::RestoreRetrying {
                     attempt,
                     max_attempts: attempts,
@@ -740,7 +751,7 @@ fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Completion> {
                         let _ = tx.send(Event::Checkpoints { json, raw });
                     }
                     let log_tail = || {
-                        let tail = sys::error_tail(20);
+                        let tail = failure_tail();
                         if tail.is_empty() {
                             format!("idevicerestore_start returned {rc}")
                         } else {
@@ -894,15 +905,15 @@ mod tests {
                        ipsw_extract_send: send failed"
                 .into(),
         };
-        assert!(is_transient_failure(&transport));
+        assert!(transport.is_transient_restore_failure());
 
         let real = Error::RestoreFailed {
             status: -1,
             log_tail: "unable to get SHSH blobs for this device".into(),
         };
-        assert!(!is_transient_failure(&real));
+        assert!(!real.is_transient_restore_failure());
 
-        assert!(!is_transient_failure(&Error::WaitTimeout));
+        assert!(!Error::WaitTimeout.is_transient_restore_failure());
     }
 
     #[test]
