@@ -755,6 +755,8 @@ pub enum UsbMode {
     /// RemoteXPC/NCM sidecar) advertising its Apple serial number; its exact
     /// model and ECID are filled in separately by [`identify`].
     Booted,
+    /// An iPhone or iPad running iOS or iPadOS, as its usbmux interface.
+    Mobile,
     /// A Mac's USB-C port controller presenting a USB Billboard device — the
     /// fallback a port exposes after an alternate mode (e.g. Thunderbolt)
     /// fails to enter, as happens over a USB 2.0-only dongle. This is the port
@@ -762,7 +764,7 @@ pub enum UsbMode {
     /// or ECID, only the controller's own UID and the alt-mode SVID it tried.
     /// Put the Mac in DFU to read its real identity.
     Billboard,
-    /// Any other Apple USB device (e.g. an iPhone in normal mode).
+    /// Any other Apple USB device.
     Other,
 }
 
@@ -775,6 +777,7 @@ impl UsbMode {
             0x1280..=0x1283 => UsbMode::Recovery,
             0x1222 => UsbMode::Wtf,
             0x12ac => UsbMode::Restore,
+            0x1290..=0x12af => UsbMode::Mobile,
             // The RemoteXPC/NCM gadget a booted macOS exposes to a USB host,
             // by model family: Mac mini, MacBook Pro, MacBook Air, iMac, then
             // every MacNN,N (order unverified; see booted_pid_prefix).
@@ -797,6 +800,7 @@ impl fmt::Display for UsbMode {
             UsbMode::Wtf => "wtf",
             UsbMode::Restore => "restore",
             UsbMode::Booted => "booted",
+            UsbMode::Mobile => "mobile",
             UsbMode::Billboard => "billboard",
             UsbMode::Other => "other",
         })
@@ -1124,16 +1128,75 @@ fn parse_port_dfu_serial(serial: &str) -> Option<(u16, u8, u64, Option<String>, 
     Some((cpid, bdid, ecid?, None, None))
 }
 
-/// Some Macs (booted / "other" mode) expose a `CPID-ECID` USB serial like
-/// `00008103-000445E11462001E` — 8 hex CPID, a dash, then the 16-hex ECID.
-/// Pull the ECID out of it when the richer `parse_serial` finds nothing.
+/// A restore OS and some booted Macs expose a `CPID-ECID` USB serial like
+/// `00008103-000445E11462001E` — 8 hex CPID, a dash, then the 16-hex ECID. A
+/// running iPhone or iPad gives the same digits without the dash. Pull the
+/// ECID out of it when the richer `parse_serial` finds nothing.
 fn ecid_from_usb_serial(serial: &str) -> Option<u64> {
-    let (cpid, ecid) = serial.split_once('-')?;
+    let (cpid, ecid) = serial
+        .split_once('-')
+        .or_else(|| (serial.len() == 24).then(|| serial.split_at(8)))?;
     let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
     if hex(cpid, 8) && hex(ecid, 16) {
         u64::from_str_radix(ecid, 16).ok()
     } else {
         None
+    }
+}
+
+/// What an Apple device's IDs and USB serial say of it, without opening it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Description {
+    pub mode: UsbMode,
+    /// The ECID its serial carries; never zero.
+    pub ecid: Option<u64>,
+    /// The hardware serial number: iBoot's `SRNM`, or a booted Mac's serial.
+    pub srnm: Option<String>,
+    /// Chip and board, from a restore-family serial.
+    pub identity: Option<Identity>,
+}
+
+/// Describe a device by its IDs and USB serial alone. A KIS device's serial is
+/// the identity read over KIS, which [`from_usb`] reads; its USB serial says
+/// nothing. A non-Apple device is [`UsbMode::Other`].
+pub fn describe(vendor_id: u16, product_id: u16, serial: &str) -> Description {
+    let apple = vendor_id == APPLE_VID;
+    let mode = if apple {
+        UsbMode::from_pid(product_id)
+    } else {
+        UsbMode::Other
+    };
+    // Windows reports string descriptors with their trailing NULs.
+    let serial = serial.trim_end_matches('\0');
+    let parsed = if !apple {
+        None
+    } else if mode == UsbMode::PortDfu {
+        parse_port_dfu_serial(serial)
+    } else {
+        parse_serial(serial)
+    };
+    let ecid = parsed
+        .as_ref()
+        .map(|(_, _, ecid, _, _)| *ecid)
+        .or_else(|| apple.then(|| ecid_from_usb_serial(serial)).flatten())
+        .filter(|&ecid| ecid != 0);
+    // The hardware serial from iBoot's SRNM (recovery), else the raw USB serial
+    // for a booted Mac (which already is the Apple serial).
+    let srnm = parsed
+        .as_ref()
+        .and_then(|(_, _, _, _, srnm)| srnm.clone())
+        .or_else(|| (mode == UsbMode::Booted && !serial.is_empty()).then(|| serial.to_owned()));
+    let identity = parsed.map(|(cpid, bdid, _, srtg, _)| Identity {
+        cpid,
+        bdid,
+        srtg,
+        model: lookup(cpid, bdid).copied(),
+    });
+    Description {
+        mode,
+        ecid,
+        srnm,
+        identity,
     }
 }
 
@@ -1147,18 +1210,13 @@ fn ecid_from_usb_serial(serial: &str) -> Option<u64> {
 /// retries for up to a few seconds while the host finishes attaching it. Don't
 /// call it from a hotplug callback or an async task.
 pub fn from_usb(info: &nusb::DeviceInfo) -> Device {
-    let apple = info.vendor_id() == APPLE_VID;
-    let mut mode = if apple {
-        UsbMode::from_pid(info.product_id())
-    } else {
-        UsbMode::Other
-    };
-    let serial = match mode {
+    let (vendor, product) = (info.vendor_id(), info.product_id());
+    let mut kis_in_dfu = true;
+    let serial = match describe(vendor, product, "").mode {
         UsbMode::Kis => match crate::kis::identify(info) {
             crate::kis::Read::Serial(s) => Some(s),
-            // Debug USB without DFU behind it isn't a restore mode.
             crate::kis::Read::NotInDfu => {
-                mode = UsbMode::Other;
+                kis_in_dfu = false;
                 None
             }
             crate::kis::Read::Failed => None,
@@ -1166,29 +1224,17 @@ pub fn from_usb(info: &nusb::DeviceInfo) -> Device {
         _ => info.serial_number().map(str::to_string),
     }
     .unwrap_or_default();
-    let parsed = if !apple {
-        None
-    } else if mode == UsbMode::PortDfu {
-        parse_port_dfu_serial(&serial)
-    } else {
-        parse_serial(&serial)
-    };
-    let ecid = parsed
-        .as_ref()
-        .map(|(_, _, ecid, _, _)| *ecid)
-        .or_else(|| apple.then(|| ecid_from_usb_serial(&serial)).flatten());
-    // The hardware serial from iBoot's SRNM (recovery), else the raw USB serial
-    // for a booted Mac (which already is the Apple serial).
-    let srnm = parsed
-        .as_ref()
-        .and_then(|(_, _, _, _, srnm)| srnm.clone())
-        .or_else(|| (mode == UsbMode::Booted && !serial.is_empty()).then(|| serial.clone()));
-    let identity = parsed.map(|(cpid, bdid, _, srtg, _)| Identity {
-        cpid,
-        bdid,
-        srtg,
-        model: lookup(cpid, bdid).copied(),
-    });
+    let Description {
+        mut mode,
+        ecid,
+        srnm,
+        identity,
+    } = describe(vendor, product, &serial);
+    // Debug USB without DFU behind it isn't a restore mode.
+    if !kis_in_dfu {
+        mode = UsbMode::Other;
+    }
+    let serial = serial.trim_end_matches('\0').to_owned();
     Device {
         driver_ready: driver_ready(info, mode),
         mode,
@@ -1783,7 +1829,39 @@ mod tests {
         }
         assert_eq!(UsbMode::from_pid(0x12ac), UsbMode::Restore);
         assert_eq!(UsbMode::from_pid(0x1283), UsbMode::Recovery);
-        assert_eq!(UsbMode::from_pid(0x12ab), UsbMode::Other);
+        assert_eq!(UsbMode::from_pid(0x12ab), UsbMode::Mobile);
+        assert_eq!(UsbMode::from_pid(0x1300), UsbMode::Other);
+    }
+
+    #[test]
+    fn describes_a_device_by_its_ids_and_serial() {
+        let dfu = describe(
+            APPLE_VID,
+            DFU_PID,
+            "CPID:8103 CPRV:11 BDID:26 ECID:000C60A812345678 SRTG:[iBoot-1234]\0",
+        );
+        assert_eq!(dfu.mode, UsbMode::Dfu);
+        assert_eq!(dfu.ecid, Some(0x000C60A812345678));
+        let identity = dfu.identity.unwrap();
+        assert_eq!((identity.cpid, identity.bdid), (0x8103, 0x26));
+        assert_eq!(
+            describe(APPLE_VID, 0x12a8, "00008030001A3D2E0C38802E").ecid,
+            Some(0x001A3D2E0C38802E)
+        );
+        assert_eq!(
+            describe(APPLE_VID, 0x12a8, "00008030001A3D2E0C38802E").mode,
+            UsbMode::Mobile
+        );
+        assert_eq!(
+            describe(APPLE_VID, 0x12ac, "00008103-000445E11462001E").ecid,
+            Some(0x000445E11462001E)
+        );
+        assert_eq!(
+            describe(APPLE_VID, DFU_PID, "CPID:8103 BDID:26 ECID:0").ecid,
+            None
+        );
+        let other = describe(0x303a, DFU_PID, "CPID:8103 BDID:26 ECID:1");
+        assert_eq!((other.mode, other.ecid), (UsbMode::Other, None));
     }
 
     #[test]

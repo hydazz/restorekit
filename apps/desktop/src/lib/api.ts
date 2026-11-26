@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { downloadDir, join } from "@tauri-apps/api/path";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
-export type Mode = "dfu" | "port-dfu" | "kis" | "recovery" | "wtf" | "restore" | "booted" | "billboard" | "other";
+export type Mode = "dfu" | "port-dfu" | "kis" | "recovery" | "wtf" | "restore" | "booted" | "mobile" | "billboard" | "other";
 
 /** The host USB-C port a device is cabled to (macOS only). */
 export interface Port {

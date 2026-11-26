@@ -18,7 +18,7 @@ const DONGLE_DFU_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Serialize)]
 pub struct DeviceView {
     /// "dfu" | "port-dfu" | "kis" | "recovery" | "wtf" | "restore" | "booted" |
-    /// "billboard" | "other"
+    /// "mobile" | "billboard" | "other"
     pub mode: String,
     pub name: String,
     /// What it is: "Mac" | "iPhone" | "iPad" | "iPod" | … | "device" when the
