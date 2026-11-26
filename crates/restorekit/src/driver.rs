@@ -336,7 +336,7 @@ mod winusb {
             let key = unsafe {
                 SetupDiOpenDevRegKey(self.set, &self.data, DICS_FLAG_GLOBAL, 0, which, KEY_READ)
             };
-            (key != INVALID_HANDLE_VALUE as HKEY).then_some(key)
+            (!std::ptr::eq(key, INVALID_HANDLE_VALUE)).then_some(key)
         }
 
         fn driver(&self) -> Option<Driver> {
@@ -368,7 +368,7 @@ mod winusb {
                     null_mut(),
                     null(),
                 );
-                if key == INVALID_HANDLE_VALUE as HKEY {
+                if std::ptr::eq(key, INVALID_HANDLE_VALUE) {
                     return Err(err("opening the device's registry key"));
                 }
                 // REG_MULTI_SZ: the string, its NUL, and the list's closing NUL.
