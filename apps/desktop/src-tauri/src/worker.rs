@@ -7,7 +7,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use restorekit::restore::{self, Mode};
+use restorekit::restore::{Mode, Restore};
 
 /// Marker arg that puts this binary into restore-worker mode.
 pub const RESTORE_WORKER_ARG: &str = "--restore-worker";
@@ -49,7 +49,12 @@ pub fn maybe_run() -> bool {
     };
 
     let mut stdout = std::io::stdout();
-    let result = restore::restore(&ipsw, ecid, cache.as_deref(), mode, true, &mut |event| {
+    let restore = Restore {
+        cache_dir: cache.as_deref(),
+        verbose: true,
+        ..Restore::new(&ipsw, ecid, mode)
+    };
+    let result = restore.run(&mut |event| {
         if let Ok(line) = serde_json::to_string(&event) {
             let _ = writeln!(stdout, "{line}");
             let _ = stdout.flush();

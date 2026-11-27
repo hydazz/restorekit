@@ -157,6 +157,12 @@ extern "C" {
     pub fn idevicerestore_start(client: *mut idevicerestore_client_t) -> c_int;
     /// Name of a device operation code ("Unknown operation" when there's none).
     pub fn restore_progress_string(operation: u32) -> *const c_char;
+    /// What the restore OS does after its final status: `"Reboot"` or
+    /// `"Shutdown"`; NULL sends nothing.
+    pub fn idevicerestore_set_post_restore_action(
+        client: *mut idevicerestore_client_t,
+        action: *const c_char,
+    );
     /// libtatsu's TSS logging. At 1 it prints why a TSS request failed (Apple's
     /// status code and message) to stderr; at 0 (the default) it prints nothing.
     pub fn tss_set_debug_level(level: c_int);

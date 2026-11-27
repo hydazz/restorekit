@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use indicatif::{ProgressBar, ProgressStyle};
 use restorekit::device::{self, UsbMode};
 use restorekit::progress::Event;
-use restorekit::restore::Mode;
-use restorekit::{firmware, recovery, restore, Device, Error, Result};
+use restorekit::restore::{self, Mode};
+use restorekit::{firmware, recovery, Device, Error, Restore, Result};
 
 use super::render;
 
@@ -327,29 +327,27 @@ fn restore_device(device: &Device, opts: Opts, prepared: Option<PathBuf>) -> Res
     let mut wipe: Option<(String, String)> = None;
     let mut checkpoints: Option<(Vec<String>, Vec<String>)> = None;
     let mut timer = PhaseTimer::new();
-    let result = restore::restore(
-        &ipsw_path,
-        ecid,
-        Some(&cache),
-        mode,
-        opts.verbose,
-        &mut |event| {
-            timer.event(&event);
-            match &event {
-                Event::Obliteration { status, detail } => {
-                    let strong = status == "confirmed" || status == "failed";
-                    if wipe.is_none() || strong {
-                        wipe = Some((status.clone(), detail.clone()));
-                    }
+    let restore = Restore {
+        cache_dir: Some(&cache),
+        verbose: opts.verbose,
+        ..Restore::new(&ipsw_path, ecid, mode)
+    };
+    let result = restore.run(&mut |event| {
+        timer.event(&event);
+        match &event {
+            Event::Obliteration { status, detail } => {
+                let strong = status == "confirmed" || status == "failed";
+                if wipe.is_none() || strong {
+                    wipe = Some((status.clone(), detail.clone()));
                 }
-                Event::Checkpoints { json, raw } => {
-                    checkpoints = Some((json.clone(), raw.clone()));
-                }
-                _ => {}
             }
-            restore_render(&bar, event, json);
-        },
-    );
+            Event::Checkpoints { json, raw } => {
+                checkpoints = Some((json.clone(), raw.clone()));
+            }
+            _ => {}
+        }
+        restore_render(&bar, event, json);
+    });
     timer.finish();
     bar.finish_and_clear();
     // Show where the wall-clock went, whether the restore succeeded or not.

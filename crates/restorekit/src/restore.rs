@@ -66,6 +66,67 @@ impl Obliteration {
     }
 }
 
+/// What the restore OS does once it has sent its final status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PostRestoreAction {
+    /// Start the restored system, as the restore OS does unless told
+    /// otherwise.
+    #[default]
+    Reboot,
+    /// Power off.
+    Shutdown,
+}
+
+/// One restore: the device, its image, and how to restore it.
+#[derive(Debug, Clone, Copy)]
+pub struct Restore<'a> {
+    /// The restore image (IPSW).
+    pub ipsw: &'a Path,
+    /// The target's ECID. Zero is not a target.
+    pub ecid: u64,
+    pub mode: Mode,
+    /// Where idevicerestore keeps what it downloads between restores.
+    pub cache_dir: Option<&'a Path>,
+    /// What the restore OS does after it reports the restore finished.
+    pub after: PostRestoreAction,
+    /// Echo idevicerestore's log to stderr.
+    pub verbose: bool,
+}
+
+impl<'a> Restore<'a> {
+    /// A quiet restore without a cache that reboots the target at the end.
+    pub fn new(ipsw: &'a Path, ecid: u64, mode: Mode) -> Self {
+        Restore {
+            ipsw,
+            ecid,
+            mode,
+            cache_dir: None,
+            after: PostRestoreAction::default(),
+            verbose: false,
+        }
+    }
+
+    /// Run the restore, streaming progress.
+    ///
+    /// The engine takes the device in DFU or recovery mode. A Mac restores
+    /// from DFU ([`crate::dfu`]); [`crate::recovery::enter`] takes a running
+    /// iPhone or iPad to recovery mode.
+    ///
+    /// This links libidevicerestore statically; there is no external binary.
+    /// Transient transport failures (dropped USB writes) are retried a
+    /// bounded number of times, re-running the restore from device detection.
+    pub fn run(&self, progress: ProgressFn) -> Result<Obliteration> {
+        run(self, progress, RESTORE_ATTEMPTS)
+    }
+
+    /// [`run`](Self::run) without the retry: a failure is returned after one
+    /// pass, for a caller that supervises its own restore processes and
+    /// decides what a failure means.
+    pub fn attempt(&self, progress: ProgressFn) -> Result<Obliteration> {
+        run(self, progress, 1)
+    }
+}
+
 /// Accumulates obliteration signals seen in the restore log stream. Failure
 /// dominates success; the first line of each kind is kept as evidence.
 #[derive(Default)]
@@ -365,65 +426,15 @@ pub fn preflight() -> Result<()> {
     Ok(())
 }
 
-/// Run a restore against the device with the given ECID, streaming progress.
-///
-/// The engine takes the device in DFU or recovery mode. A Mac restores from
-/// DFU ([`crate::dfu`]); [`crate::recovery::enter`] takes a running iPhone or
-/// iPad to recovery mode.
-///
-/// This links libidevicerestore statically; there is no external binary.
-/// Transient transport failures (dropped USB writes) are retried a bounded
-/// number of times, re-running the restore from device detection.
-pub fn restore(
-    ipsw: &Path,
-    ecid: u64,
-    cache_dir: Option<&Path>,
-    mode: Mode,
-    verbose: bool,
-    progress: ProgressFn,
-) -> Result<Obliteration> {
-    run(
-        ipsw,
-        ecid,
-        cache_dir,
-        mode,
-        verbose,
-        progress,
-        RESTORE_ATTEMPTS,
-    )
-}
-
-/// [`restore`] without the retry: a failure is returned after one pass, for a
-/// caller that supervises its own restore processes and decides what a
-/// failure means.
-pub fn restore_attempt(
-    ipsw: &Path,
-    ecid: u64,
-    cache_dir: Option<&Path>,
-    mode: Mode,
-    verbose: bool,
-    progress: ProgressFn,
-) -> Result<Obliteration> {
-    run(ipsw, ecid, cache_dir, mode, verbose, progress, 1)
-}
-
 /// Hold the restore lock and what the platform needs around a restore, then
 /// make up to `attempts` passes.
-fn run(
-    ipsw: &Path,
-    ecid: u64,
-    cache_dir: Option<&Path>,
-    mode: Mode,
-    verbose: bool,
-    progress: ProgressFn,
-    attempts: u32,
-) -> Result<Obliteration> {
+fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Obliteration> {
     let _guard = RESTORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _restoring = Restoring::begin(ecid)?;
+    let _restoring = Restoring::begin(restore.ecid)?;
     // Keep other restores on this host off a Mac in DFU over Debug USB, and
     // this one off theirs.
     #[cfg(target_os = "macos")]
-    let _claim = crate::kis::claim::hold(ecid)?;
+    let _claim = crate::kis::claim::hold(restore.ecid)?;
 
     // On Linux and Windows, start the embedded usbmuxd server so idevicerestore
     // can reach USB devices (restore mode) without an external daemon — unless a
@@ -454,7 +465,7 @@ fn run(
 
     let mut attempt = 1;
     loop {
-        match run_once(ipsw, ecid, cache_dir, mode, verbose, progress) {
+        match run_once(restore, progress) {
             Ok(obliteration) => {
                 // The worker already emitted the Obliteration event (it fires on
                 // failure too); just close out the successful run.
@@ -476,14 +487,15 @@ fn run(
 }
 
 /// One full pass of the restore: spawn the worker, pump progress, join.
-fn run_once(
-    ipsw: &Path,
-    ecid: u64,
-    cache_dir: Option<&Path>,
-    mode: Mode,
-    verbose: bool,
-    progress: ProgressFn,
-) -> Result<Obliteration> {
+fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Obliteration> {
+    let Restore {
+        ipsw,
+        ecid,
+        mode,
+        cache_dir,
+        after,
+        verbose,
+    } = *restore;
     // Route idevicerestore's logging through our capture sink (rather than its
     // default stdout dump) so it doesn't stomp on the progress UI and so we can
     // surface the real error text on failure. `verbose` also echoes to stderr.
@@ -564,6 +576,13 @@ fn run_once(
                     };
                     sys::idevicerestore_set_flags(client, flags);
                     sys::idevicerestore_set_ipsw(client, ipsw_c.as_ptr());
+                    match after {
+                        PostRestoreAction::Reboot => {}
+                        PostRestoreAction::Shutdown => sys::idevicerestore_set_post_restore_action(
+                            client,
+                            c"Shutdown".as_ptr(),
+                        ),
+                    }
                     if let Some(cache) = &cache_c {
                         sys::idevicerestore_set_cache_path(client, cache.as_ptr());
                     }

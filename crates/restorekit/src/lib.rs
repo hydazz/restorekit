@@ -31,7 +31,7 @@
 //!
 //! ```no_run
 //! use std::time::Duration;
-//! use restorekit::{device, firmware, restore, Event, Mode, Result};
+//! use restorekit::{device, firmware, Event, Mode, Restore, Result};
 //!
 //! fn main() -> Result<()> {
 //!     // Pick a target: the sole Mac in DFU mode (Target::Ecid picks one of
@@ -52,7 +52,11 @@
 //!     })?;
 //!
 //!     // Erase-restore the device, printing each step.
-//!     restore::restore(&ipsw, ecid, Some(&cache), Mode::Erase, false, &mut |event| {
+//!     let restore = Restore {
+//!         cache_dir: Some(&cache),
+//!         ..Restore::new(&ipsw, ecid, Mode::Erase)
+//!     };
+//!     restore.run(&mut |event| {
 //!         if let Event::RestoreStep { name, progress, .. } = event {
 //!             eprintln!("{name}: {:.0}%", progress * 100.0);
 //!         }
@@ -90,7 +94,7 @@ pub use dongle::{Connection, Dongle, DongleHandle, DongleStatus, DongleTarget, P
 pub use error::{Error, Result};
 pub use firmware::Firmware;
 pub use progress::Event;
-pub use restore::{Mode, Obliteration};
+pub use restore::{Mode, Obliteration, PostRestoreAction, Restore};
 
 /// Re-exported for [`device::from_usb`] and [`device::forget_absent`], which
 /// take its types.

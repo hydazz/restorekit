@@ -1,8 +1,8 @@
 use restorekit::device::{self, parse_serial, Device};
 use restorekit::dongle;
-use restorekit::restore::Mode;
+use restorekit::restore::{Mode, Restore};
 use restorekit::{
-    dfu, firmware, recovery, restore, DfuOutcome, DfuVia, DongleStatus, Firmware, UsbMode,
+    dfu, firmware, recovery, DfuOutcome, DfuVia, DongleStatus, Firmware, UsbMode,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -593,18 +593,16 @@ pub async fn restore(
             "obliterate" => Mode::Obliterate,
             _ => Mode::Erase,
         };
-        restore::restore(
-            std::path::Path::new(&ipsw),
-            ecid,
-            cache.as_deref(),
-            mode,
-            false,
-            &mut |event| {
+        let restore = Restore {
+            cache_dir: cache.as_deref(),
+            ..Restore::new(std::path::Path::new(&ipsw), ecid, mode)
+        };
+        restore
+            .run(&mut |event| {
                 let _ = app.emit("progress", &event);
-            },
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+            })
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
