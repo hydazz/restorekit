@@ -163,6 +163,12 @@ extern "C" {
         client: *mut idevicerestore_client_t,
         action: *const c_char,
     );
+    /// The Status of the last status message the restore OS sent during
+    /// `idevicerestore_start`; -1 when it sent none.
+    pub fn idevicerestore_get_final_status(
+        client: *mut idevicerestore_client_t,
+        status: *mut u64,
+    ) -> c_int;
     /// libtatsu's TSS logging. At 1 it prints why a TSS request failed (Apple's
     /// status code and message) to stderr; at 0 (the default) it prints nothing.
     pub fn tss_set_debug_level(level: c_int);

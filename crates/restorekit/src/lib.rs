@@ -94,7 +94,7 @@ pub use dongle::{Connection, Dongle, DongleHandle, DongleStatus, DongleTarget, P
 pub use error::{Error, Result};
 pub use firmware::Firmware;
 pub use progress::Event;
-pub use restore::{Mode, Obliteration, PostRestoreAction, Restore};
+pub use restore::{Completion, DeviceStatus, Mode, Obliteration, PostRestoreAction, Restore};
 
 /// Re-exported for [`device::from_usb`] and [`device::forget_absent`], which
 /// take its types.

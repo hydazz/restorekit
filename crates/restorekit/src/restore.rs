@@ -77,6 +77,55 @@ pub enum PostRestoreAction {
     Shutdown,
 }
 
+/// The status the restore OS reports in its final status message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceStatus(pub u64);
+
+impl DeviceStatus {
+    /// Whether the restore OS reported the restore finished.
+    pub fn finished(self) -> bool {
+        self.0 == 0
+    }
+
+    /// idevicerestore's name for the status, where it has one.
+    pub fn name(self) -> Option<&'static str> {
+        Some(match self.0 {
+            0 => "Restore Finished",
+            u64::MAX => "Verification Error",
+            6 => "Disk Failure",
+            14 => "Fail",
+            27 => "Failed to mount filesystems",
+            50 | 51 => "Failed to load SEP Firmware",
+            53 => "Failed to recover FDR data",
+            1015 => "X-Gold Baseband Update Failed",
+            _ => return None,
+        })
+    }
+}
+
+impl std::fmt::Display for DeviceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Apple's codes are signed: 0xFFFFFFFFFFFFFFFF is -1.
+        let code = self.0 as i64;
+        match self.name() {
+            Some(name) => write!(f, "{name} ({code})"),
+            None => write!(f, "status {code}"),
+        }
+    }
+}
+
+/// How a restore that succeeded ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Completion {
+    /// The restore OS reported the restore finished: its final status was 0.
+    /// The erase's verdict on the media key comes with it.
+    Finished(Obliteration),
+    /// [`Mode::Obliterate`] stopped once the device reported its effaceable
+    /// storage formatted, before an OS went on, as it is meant to. The
+    /// restore OS sends no final status then. `evidence` is the log line.
+    Obliterated { evidence: String },
+}
+
 /// One restore: the device, its image, and how to restore it.
 #[derive(Debug, Clone, Copy)]
 pub struct Restore<'a> {
@@ -115,14 +164,15 @@ impl<'a> Restore<'a> {
     /// This links libidevicerestore statically; there is no external binary.
     /// Transient transport failures (dropped USB writes) are retried a
     /// bounded number of times, re-running the restore from device detection.
-    pub fn run(&self, progress: ProgressFn) -> Result<Obliteration> {
+    /// A restore the device itself reported failed is not retried.
+    pub fn run(&self, progress: ProgressFn) -> Result<Completion> {
         run(self, progress, RESTORE_ATTEMPTS)
     }
 
     /// [`run`](Self::run) without the retry: a failure is returned after one
     /// pass, for a caller that supervises its own restore processes and
     /// decides what a failure means.
-    pub fn attempt(&self, progress: ProgressFn) -> Result<Obliteration> {
+    pub fn attempt(&self, progress: ProgressFn) -> Result<Completion> {
         run(self, progress, 1)
     }
 }
@@ -428,7 +478,7 @@ pub fn preflight() -> Result<()> {
 
 /// Hold the restore lock and what the platform needs around a restore, then
 /// make up to `attempts` passes.
-fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Obliteration> {
+fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Completion> {
     let _guard = RESTORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restoring = Restoring::begin(restore.ecid)?;
     // Keep other restores on this host off a Mac in DFU over Debug USB, and
@@ -466,11 +516,11 @@ fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Obliter
     let mut attempt = 1;
     loop {
         match run_once(restore, progress) {
-            Ok(obliteration) => {
+            Ok(completion) => {
                 // The worker already emitted the Obliteration event (it fires on
                 // failure too); just close out the successful run.
                 progress(Event::Done);
-                return Ok(obliteration);
+                return Ok(completion);
             }
             Err(e) if attempt < attempts && is_transient_failure(&e) => {
                 progress(Event::RestoreRetrying {
@@ -486,8 +536,36 @@ fn run(restore: &Restore, progress: ProgressFn, attempts: u32) -> Result<Obliter
     }
 }
 
+/// What one pass of the restore proved, from idevicerestore's return code and
+/// the final status the restore OS sent, if it sent one.
+fn outcome(
+    rc: i32,
+    device: Option<DeviceStatus>,
+    mode: Mode,
+    obliteration: Obliteration,
+    log_tail: impl FnOnce() -> String,
+) -> Result<Completion> {
+    match device {
+        Some(status) if !status.finished() => Err(Error::DeviceReportedFailure {
+            status,
+            log_tail: log_tail(),
+        }),
+        _ if rc != 0 => Err(Error::RestoreFailed {
+            status: rc,
+            log_tail: log_tail(),
+        }),
+        Some(_) => Ok(Completion::Finished(obliteration)),
+        None => match obliteration {
+            Obliteration::Confirmed { evidence } if mode == Mode::Obliterate => {
+                Ok(Completion::Obliterated { evidence })
+            }
+            _ => Err(Error::NoFinalStatus),
+        },
+    }
+}
+
 /// One full pass of the restore: spawn the worker, pump progress, join.
-fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Obliteration> {
+fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Completion> {
     let Restore {
         ipsw,
         ecid,
@@ -537,7 +615,7 @@ fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Obliteration> {
     let worker = std::thread::Builder::new()
         .name("restore".into())
         .stack_size(RESTORE_STACK)
-        .spawn(move || -> Result<Obliteration> {
+        .spawn(move || -> Result<Completion> {
             // The C libraries open these through the C runtime, which can't
             // take a verbatim (`\\?\`) path such as `canonicalize` returns on
             // Windows.
@@ -631,6 +709,9 @@ fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Obliteration> {
                     })));
                     let rc = sys::idevicerestore_start(client);
                     sys::set_log_sink(None);
+                    let mut status = 0;
+                    let device = (sys::idevicerestore_get_final_status(client, &mut status) == 0)
+                        .then_some(DeviceStatus(status));
                     let obliteration = match mode {
                         Mode::Revive => Obliteration::NotApplicable,
                         Mode::Erase | Mode::Obliterate => {
@@ -658,20 +739,15 @@ fn run_once(restore: &Restore, progress: ProgressFn) -> Result<Obliteration> {
                     if !json.is_empty() || !raw.is_empty() {
                         let _ = tx.send(Event::Checkpoints { json, raw });
                     }
-                    if rc == 0 {
-                        Ok(obliteration)
-                    } else {
+                    let log_tail = || {
                         let tail = sys::error_tail(20);
-                        let log_tail = if tail.is_empty() {
+                        if tail.is_empty() {
                             format!("idevicerestore_start returned {rc}")
                         } else {
                             tail
-                        };
-                        Err(Error::RestoreFailed {
-                            status: rc,
-                            log_tail,
-                        })
-                    }
+                        }
+                    };
+                    outcome(rc, device, mode, obliteration, log_tail)
                 })();
 
                 sys::idevicerestore_client_free(client);
@@ -744,6 +820,70 @@ mod tests {
         assert!(matches!(s.result(), Obliteration::Confirmed { .. }));
         s.observe("failed to format effaceable storage");
         assert!(matches!(s.result(), Obliteration::Failed { .. }));
+    }
+
+    #[test]
+    fn only_the_restore_os_final_status_finishes_a_restore() {
+        let tail = || "tail".to_string();
+        let confirmed = || Obliteration::Confirmed {
+            evidence: "format_effaceable_storage result=0".into(),
+        };
+        assert_eq!(
+            outcome(0, Some(DeviceStatus(0)), Mode::Erase, confirmed(), tail).unwrap(),
+            Completion::Finished(confirmed())
+        );
+        // idevicerestore returned 0 but the restore OS never said it finished.
+        assert!(matches!(
+            outcome(0, None, Mode::Erase, Obliteration::Unconfirmed, tail),
+            Err(Error::NoFinalStatus)
+        ));
+        assert!(matches!(
+            outcome(0, None, Mode::Revive, Obliteration::NotApplicable, tail),
+            Err(Error::NoFinalStatus)
+        ));
+        // The device's failure wins over the transport error that follows it.
+        assert!(matches!(
+            outcome(
+                -11,
+                Some(DeviceStatus(6)),
+                Mode::Erase,
+                Obliteration::Unconfirmed,
+                tail
+            ),
+            Err(Error::DeviceReportedFailure {
+                status: DeviceStatus(6),
+                ..
+            })
+        ));
+        // Finished, then an AMRError or a failed asynchronous request.
+        assert!(matches!(
+            outcome(-14, Some(DeviceStatus(0)), Mode::Erase, confirmed(), tail),
+            Err(Error::RestoreFailed { status: -14, .. })
+        ));
+        assert!(matches!(
+            outcome(-1, None, Mode::Erase, Obliteration::Unconfirmed, tail),
+            Err(Error::RestoreFailed { status: -1, .. })
+        ));
+        // Obliterate stops after the wipe and gets no final status.
+        assert!(matches!(
+            outcome(0, None, Mode::Obliterate, confirmed(), tail),
+            Ok(Completion::Obliterated { .. })
+        ));
+        assert!(matches!(
+            outcome(0, None, Mode::Obliterate, Obliteration::Unconfirmed, tail),
+            Err(Error::NoFinalStatus)
+        ));
+    }
+
+    #[test]
+    fn device_statuses_read_as_idevicerestore_names_them() {
+        assert_eq!(DeviceStatus(0).to_string(), "Restore Finished (0)");
+        assert_eq!(DeviceStatus(6).to_string(), "Disk Failure (6)");
+        assert_eq!(
+            DeviceStatus(u64::MAX).to_string(),
+            "Verification Error (-1)"
+        );
+        assert_eq!(DeviceStatus(1234).to_string(), "status 1234");
     }
 
     #[test]

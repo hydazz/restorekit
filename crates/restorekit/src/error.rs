@@ -148,6 +148,15 @@ pub enum Error {
     #[error("restore failed (exit {status}); last output:\n{log_tail}")]
     RestoreFailed { status: i32, log_tail: String },
 
+    #[error("the device reported the restore failed: {status}; last output:\n{log_tail}")]
+    DeviceReportedFailure {
+        status: crate::restore::DeviceStatus,
+        log_tail: String,
+    },
+
+    #[error("the restore ended without the device's final status")]
+    NoFinalStatus,
+
     #[error("could not determine home directory")]
     NoHomeDir,
 
