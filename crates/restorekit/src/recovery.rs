@@ -74,23 +74,7 @@ pub fn enter(ecid: u64, supervisor: Option<&Supervisor>) -> Result<()> {
     if code != sys::LOCKDOWN_E_SESSION_INACTIVE {
         return check(code);
     }
-    if let Some(supervisor) = supervisor.filter(|_| !device.paired()) {
-        supervisor.pair(&device)?;
-    }
-    let lockdown = match Lockdown::handshake(&device) {
-        // A pair record from before the device was erased.
-        Err(Error::Lockdown {
-            code: sys::LOCKDOWN_E_INVALID_HOST_ID,
-            ..
-        }) => {
-            match supervisor {
-                Some(supervisor) => supervisor.pair(&device)?,
-                None => Lockdown::connect(&device)?.pair()?,
-            }
-            Lockdown::handshake(&device)?
-        }
-        lockdown => lockdown?,
-    };
+    let lockdown = Lockdown::paired(&device, supervisor)?;
     check(lockdown.enter_recovery())
 }
 
@@ -417,6 +401,25 @@ pub struct RunningDevice {
 }
 
 impl RunningDevice {
+    /// Run a USB service operation in a paired lockdown session. The two handles
+    /// are borrowed for the duration of the callback and must not be freed.
+    /// The device may request trust when it does not recognize the supervisor.
+    pub fn with_paired_session<T>(
+        &self,
+        supervisor: Option<&Supervisor>,
+        operation: impl FnOnce(sys::idevice_t, sys::lockdownd_client_t) -> T,
+    ) -> Result<T> {
+        let _host = HostUsbmuxd::select()?;
+        let udid = CString::new(self.udid.as_str())
+            .map_err(|_| Error::RunningDeviceNotFound(self.ecid))?;
+        let device = Device::open(&udid).ok_or(Error::RunningDeviceNotFound(self.ecid))?;
+        let lockdown = Lockdown::paired(&device, supervisor)?;
+        if lockdown.unique_chip_id() != Some(self.ecid) {
+            return Err(Error::RunningDeviceNotFound(self.ecid));
+        }
+        Ok(operation(device.handle, lockdown.client))
+    }
+
     /// The model's name (e.g. "iPhone SE (2nd gen)"), else its product type.
     pub fn display_name(&self) -> String {
         match (&self.identity, &self.product_type) {
@@ -651,6 +654,26 @@ impl<'a> Lockdown<'a> {
             client,
             _device: PhantomData,
         })
+    }
+
+    /// Use this host's existing trust or pair with the device as its supervisor.
+    fn paired(device: &'a Device, supervisor: Option<&Supervisor>) -> Result<Self> {
+        if let Some(supervisor) = supervisor.filter(|_| !device.paired()) {
+            supervisor.pair(device)?;
+        }
+        match Self::handshake(device) {
+            Err(Error::Lockdown {
+                code: sys::LOCKDOWN_E_INVALID_HOST_ID,
+                ..
+            }) => {
+                match supervisor {
+                    Some(supervisor) => supervisor.pair(device)?,
+                    None => Self::connect(device)?.pair()?,
+                }
+                Self::handshake(device)
+            }
+            session => session,
+        }
     }
 
     /// The ECID lockdownd reports, or `None` when the service on the lockdown
