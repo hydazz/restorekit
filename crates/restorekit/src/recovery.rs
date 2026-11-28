@@ -472,6 +472,10 @@ pub fn with_existing_session<T>(
     serial: &str,
     read: impl FnOnce(sys::idevice_t, sys::lockdownd_client_t) -> T,
 ) -> Option<T> {
+    #[cfg(target_os = "linux")]
+    if host_socket_address().is_none() && !crate::usbmuxd::system_running() {
+        return None;
+    }
     let _host = HostUsbmuxd::select().ok()?;
     let key = udid_key(serial);
     let udid = udids()
