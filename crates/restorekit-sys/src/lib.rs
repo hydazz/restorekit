@@ -364,6 +364,12 @@ extern "C" {
         client: *mut lockdownd_client_t,
         label: *const c_char,
     ) -> c_int;
+    pub fn lockdownd_start_session(
+        client: lockdownd_client_t,
+        host_id: *const c_char,
+        session_id: *mut *mut c_char,
+        ssl_enabled: *mut c_int,
+    ) -> c_int;
     pub fn lockdownd_client_free(client: lockdownd_client_t) -> c_int;
     /// The service's type; free it with [`plist_mem_free`].
     pub fn lockdownd_query_type(client: lockdownd_client_t, kind: *mut *mut c_char) -> c_int;
@@ -401,6 +407,12 @@ extern "C" {
     /// null, ahead of that variable. `enable` 0 goes back to the variable. Our
     /// patch to libusbmuxd (patches/libusbmuxd).
     pub fn libusbmuxd_set_thread_socket_address(enable: c_int, address: *const c_char);
+    pub fn plist_from_memory(
+        data: *const c_char,
+        size: u32,
+        node: *mut plist_t,
+        format: *mut c_int,
+    ) -> c_int;
     pub fn plist_new_dict() -> plist_t;
     pub fn plist_new_bool(val: u8) -> plist_t;
     pub fn plist_new_data(val: *const c_char, length: u64) -> plist_t;

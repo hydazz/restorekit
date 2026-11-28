@@ -465,6 +465,34 @@ pub fn devices() -> Result<Vec<RunningDevice>> {
         .unwrap_or_default())
 }
 
+/// Read a USB device through an existing pairing. Returns None when the USB
+/// serial is absent or the device does not currently trust the host. This
+/// never submits a pairing request or prompts the user to trust the host.
+pub fn with_existing_session<T>(
+    serial: &str,
+    read: impl FnOnce(sys::idevice_t, sys::lockdownd_client_t) -> T,
+) -> Option<T> {
+    let _host = HostUsbmuxd::select().ok()?;
+    let key = udid_key(serial);
+    let udid = udids()
+        .ok()?
+        .into_iter()
+        .find(|id| udid_key(&id.to_string_lossy()) == key)?;
+    let device = Device::open(&udid)?;
+    let host = device.host_id()?;
+    let lockdown = Lockdown::connect(&device).ok()?;
+    check(unsafe {
+        sys::lockdownd_start_session(
+            lockdown.client,
+            host.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    })
+    .ok()?;
+    Some(read(device.handle, lockdown.client))
+}
+
 /// Fill in the ECID and model of each running iPhone and iPad in `devices`
 /// that [`devices()`] reaches, matched to its USB serial by UDID. Best-effort,
 /// and cheap enough to call on every poll: it asks usbmuxd nothing unless a
@@ -607,17 +635,24 @@ impl Device {
         }
     }
 
-    /// Whether the host has a pair record for the device.
-    fn paired(&self) -> bool {
+    /// The host identifier in this device's saved pair record.
+    fn host_id(&self) -> Option<CString> {
         let mut record = ptr::null_mut();
         let mut size = 0;
-        if unsafe { sys::usbmuxd_read_pair_record(self.udid.as_ptr(), &mut record, &mut size) } != 0
-        {
-            return false;
+        let mut node = Plist(ptr::null_mut());
+        unsafe {
+            if sys::usbmuxd_read_pair_record(self.udid.as_ptr(), &mut record, &mut size) != 0 {
+                return None;
+            }
+            let status = sys::plist_from_memory(record, size, &mut node.0, ptr::null_mut());
+            sys::plist_mem_free(record.cast());
+            if status != 0 {
+                return None;
+            }
+            let field = sys::plist_dict_get_item(node.0, c"HostID".as_ptr());
+            let value = sys::plist_get_string_ptr(field, ptr::null_mut());
+            (!value.is_null()).then(|| CStr::from_ptr(value).to_owned())
         }
-        // libusbmuxd allocates the record with malloc.
-        unsafe { sys::plist_mem_free(record.cast()) };
-        true
     }
 }
 
@@ -658,7 +693,7 @@ impl<'a> Lockdown<'a> {
 
     /// Use this host's existing trust or pair with the device as its supervisor.
     fn paired(device: &'a Device, supervisor: Option<&Supervisor>) -> Result<Self> {
-        if let Some(supervisor) = supervisor.filter(|_| !device.paired()) {
+        if let Some(supervisor) = supervisor.filter(|_| device.host_id().is_none()) {
             supervisor.pair(device)?;
         }
         match Self::handshake(device) {
